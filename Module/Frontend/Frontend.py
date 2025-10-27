@@ -479,8 +479,7 @@ class UFMCovFrontend(IFrontend):
             target_image=tgt_batch,
             data_norm_type="dummy"
         )
-
         
         # print("result.flow.flow_output.shape:", result.flow.flow_output.shape)
         # print("result.covisibility.mask.shape:", result.covisibility.mask.shape)
-        return result.flow.flow_output, result.covisibility.mask.unsqueeze(1).expand(-1, 2, -1, -1)  
+        return result.flow.flow_output, 1.0 / result.covisibility.mask.unsqueeze(1).expand(-1, 2, -1, -1)  
