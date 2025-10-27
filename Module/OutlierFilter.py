@@ -93,10 +93,21 @@ class CovarianceSanityFilter(IObservationFilter):
     def required_keys(self) -> set[LiteralString]: return {"obs1_covTc", "obs2_covTc"}
     
     def filter(self, values: TensorBundle, device: torch.device) -> torch.Tensor:
-        cov1_has_nan = values.data["obs1_covTc"].isnan().any(dim=[-1, -2])
-        cov1_has_inf = values.data["obs1_covTc"].isinf().any(dim=[-1, -2])
-        cov2_has_nan = values.data["obs2_covTc"].isnan().any(dim=[-1, -2])
-        cov2_has_inf = values.data["obs2_covTc"].isinf().any(dim=[-1, -2])
+        def any_last2(x: torch.Tensor) -> torch.Tensor:
+            if x.ndim >= 2:
+                x = x.reshape(*x.shape[:-2], -1)
+            else:
+                x = x.reshape(*x.shape, 1)
+            return x.any(-1)
+
+        cov1 = values.data["obs1_covTc"]
+        cov2 = values.data["obs2_covTc"]
+
+        cov1_has_nan = any_last2(torch.isnan(cov1))
+        cov1_has_inf = any_last2(torch.isinf(cov1))
+        cov2_has_nan = any_last2(torch.isnan(cov2))
+        cov2_has_inf = any_last2(torch.isinf(cov2))
+
         return ~(cov1_has_nan | cov1_has_inf | cov2_has_nan | cov2_has_inf)
     
     @classmethod

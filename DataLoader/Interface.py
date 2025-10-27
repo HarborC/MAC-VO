@@ -113,6 +113,50 @@ class StereoData(Collatable):
 
 
 @dataclass(kw_only=True)
+class MultiCameraData(Collatable):
+    # Transformation from body frame to sensor frame
+    T_BS: pp.LieTensor      # torch.float32, pp.SE3 of shape Bx7
+    K   : torch.Tensor      # torch.float32 of shape Bx3x3
+    baseline: torch.Tensor   # Baseline (m) between left and right camera, len(list) = B
+    time_ns : list[int]     # Time (ns) of data received, len(list) = B
+    height: int             # H
+    width : int             # W
+    
+    @property
+    def frame_ns(self) -> int:
+        assert len(self.time_ns) == 1, "Can only use frame_ns on unbatched data."
+        return self.time_ns[0]
+    @property
+    def frame_ms(self) -> float: return self.frame_ns / 1000.
+    @property
+    def frame_baseline(self) -> float:
+        assert self.baseline.size(0) == 1, "Can only use frame_baseline on unbatched data"
+        return self.baseline.item()
+    @property
+    def frame_K(self) -> torch.Tensor:
+        assert self.K.size(0) == 1, "Can only use frame_K on unbatched data"
+        return self.K[0]
+    
+    @property
+    def time_ms(self) -> list[float]: return [t / 1000. for t in self.time_ns]
+    
+    # Sensor Data
+    images: torch.Tensor    # torch.float32 of shape Bx3xHxW
+    stereo_idxs: list[tuple[int, int]]  # List of (left_camera_idx, right_camera_idx)
+    
+    # Label & Ground Truth
+    gt_flow  : torch.Tensor | None = None    # torch.float32 of shape Bx2xHxW 
+    flow_mask: torch.Tensor | None = None    # torch.bool    of shape Bx1xHxW
+    gt_depth : torch.Tensor | None = None    # torch.float32 of shape Bx1xHxW 
+    
+    collate_handlers = {
+        "height": lambda batch: batch[0],
+        "width" : lambda batch: batch[0],
+    }
+
+
+
+@dataclass(kw_only=True)
 class IMUData(Collatable):
     """
     (N) IMU measurements from a certain period of time

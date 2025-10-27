@@ -21,7 +21,7 @@ import torch
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import overload, Literal
+from typing import overload, Literal, Any
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -355,22 +355,175 @@ class CUDAGraph_FlowFormerCovFrontend(FlowFormerCovFrontend):
 
 class UFMCovFrontend(IFrontend):
     """
-    Placeholder for UFMCov Frontend
+    Frontend that wraps UFM (UniFlowMatch) to provide:
+      - Stereo depth (via disparity = |u| from L->R rectified pair)
+      - Temporal matching (flow from t1.L to t2.L)
+    UFM provides a covisibility/confidence map, which we use as a validity mask.
+    This frontend doesn't provide covariance for depth or flow.
     """
     def __init__(self, config: SimpleNamespace):
         super().__init__(config)
-        raise NotImplementedError("UFMCovFrontend is not implemented yet.")
+        try:
+            from ..Network.UFM.uniflowmatch.models.ufm import (
+                UniFlowMatchClassificationRefinement,
+                UniFlowMatchConfidence,
+            )
+        except Exception as e:
+            raise ImportError(
+                "uniflowmatch is required for UFMCovFrontend. Please install it and its dependencies."
+            ) from e
+
+        # Choose model variant
+        variant: str = getattr(self.config, "model", "refine")
+        pretrained_id: str | None = getattr(self.config, "pretrained_id", None)
+
+        if variant == "refine":
+            ModelCls = UniFlowMatchClassificationRefinement
+            default_id = "infinity1096/UFM-Refine-336"
+        elif variant == "base":
+            ModelCls = UniFlowMatchConfidence
+            default_id = "infinity1096/UFM-Base"
+        else:
+            raise ValueError(f"Unknown UFM model variant: {variant}")
+
+        model_id = pretrained_id or default_id
+        # Load pretrained weights
+        self.model = ModelCls.from_pretrained(model_id)
+        self.model.eval()
+
+        # Settings
+        self.device = getattr(self.config, "device", "cpu")
+        # Note: UFM pipeline internally moves tensors as needed; keep model on CPU unless library supports .to(device)
+        # Try to move if available, otherwise stay CPU
+        try:
+            if isinstance(self.device, str) and ("cuda" in self.device or self.device == "cpu"):
+                self.model.to(self.device)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        self.mask_thresh: float = float(getattr(self.config, "covisibility_threshold", 0.5))
+        self.enforce_positive_disparity: bool = bool(getattr(self.config, "enforce_positive_disparity", False))
     
     @property
     def provide_cov(self) -> tuple[bool, bool]:
-        return True, True
+        # UFM exposes covisibility mask/confidence but not covariance; return False for both
+        return False, False
     
+    @Timer.cpu_timeit("Frontend.estimate")
+    @Timer.gpu_timeit("Frontend.estimate")
     def estimate_pair(self, frame_t1: StereoData, frame_t2: StereoData) -> tuple[IStereoDepth.Output, IMatcher.Output]:
-        raise NotImplementedError("UFMCovFrontend is not implemented yet.")
+        # Try a single batched UFM call for both (t2L->t2R) and (t1L->t2L)
+        input_A = torch.cat([frame_t2.imageL, frame_t1.imageL], dim=0)
+        input_B = torch.cat([frame_t2.imageR, frame_t2.imageL], dim=0)
+
+        input_A = input_A.to(device=self.config.device)
+        input_B = input_B.to(device=self.config.device)
+
+        # Run UFM on both pairs
+        flow_all, mask_all = self._run_ufm_batch(input_A, input_B)
+
+        B = frame_t2.imageL.shape[0]
+        flow_depth = flow_all[0:B]
+        mask_depth = None if mask_all is None else mask_all[0:B]
+        flow_match = flow_all[B:2*B]
+        mask_match = None if mask_all is None else mask_all[B:2*B]
+
+        # Depth output from disparity
+        disparity = flow_depth[:, :1].abs()
+        depth_map = disparity_to_depth(disparity, frame_t2.frame_baseline, frame_t2.fx)
+
+        bad_mask = None
+        if self.enforce_positive_disparity:
+            bad_mask = flow_depth[:, :1] <= 0
+        if mask_depth is not None:
+            vis_mask_bool = mask_depth >= self.mask_thresh
+            bad_mask = vis_mask_bool if bad_mask is None else (bad_mask | (~vis_mask_bool))
+
+        depth_t2 = IStereoDepth.Output(
+            depth=depth_map,
+            disparity=disparity,
+            cov=None,
+            mask=bad_mask,
+            disparity_uncertainty=None,
+        )
+
+        match_mask = None
+        if mask_match is not None:
+            match_mask = (mask_match >= self.mask_thresh).to(dtype=torch.bool)
+        match_t12 = IMatcher.Output(flow=flow_match, cov=None, mask=match_mask)
+        return depth_t2, match_t12
     
     def estimate_depth(self, frame: StereoData) -> IStereoDepth.Output:
-        raise NotImplementedError("UFMCovFrontend is not implemented yet.")
+        input_A, input_B = frame.imageL, frame.imageR
+        input_A = input_A.to(device=self.config.device)
+        input_B = input_B.to(device=self.config.device)
+        # Use UFM on rectified stereo pair (L->R), then interpret u as disparity
+        print(input_A.dtype)
+        flow, covis_mask = self._run_ufm_batch(input_A, input_B)
+
+        # Expect flow: Bx2xHxW, covis_mask: Bx1xHxW (float or bool)
+        disparity = flow[:, :1].abs()
+        depth_map = disparity_to_depth(disparity, frame.frame_baseline, frame.fx)
+
+        # Enforce disparity direction if requested
+        bad_mask = None
+        if self.enforce_positive_disparity:
+            bad_mask = flow[:, :1] <= 0
+        # Combine visibility mask if available
+        if covis_mask is not None:
+            vis_mask_bool = covis_mask >= self.mask_thresh
+            bad_mask = vis_mask_bool if bad_mask is None else (bad_mask | (~vis_mask_bool))
+
+        return IStereoDepth.Output(
+            depth=depth_map,
+            disparity=disparity,
+            cov=None,
+            mask=bad_mask,
+            disparity_uncertainty=None,
+        )
     
     @classmethod
     def is_valid_config(cls, config: SimpleNamespace | None) -> None:
-        raise NotImplementedError("UFMCovFrontend is not implemented yet.")
+        cls._enforce_config_spec(config, {
+            "model": lambda s: s in {"base", "refine"},
+            "device": lambda s: isinstance(s, str) and ("cuda" in s or s == "cpu"),
+            "covisibility_threshold": lambda v: isinstance(v, (float, int)) and 0.0 <= float(v) <= 1.0,
+            "enforce_positive_disparity": lambda b: isinstance(b, bool),
+            # optional
+            # "pretrained_id": optional string if provided
+        })
+
+    @torch.inference_mode()
+    def _run_ufm_batch(self, src_batch: torch.Tensor, tgt_batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        result = self.model.predict_correspondences_batched(
+            source_image=src_batch,
+            target_image=tgt_batch,
+        )
+
+        flow_out = result.flow.flow_output
+        if isinstance(flow_out, torch.Tensor):
+            if flow_out.ndim == 3:
+                flow = flow_out.unsqueeze(0).to(dtype=torch.float32)
+            else:
+                flow = flow_out.to(dtype=torch.float32)  # Bx2xHxW expected
+        else:
+            flow = torch.as_tensor(flow_out, dtype=torch.float32)
+            if flow.ndim == 3:
+                flow = flow.unsqueeze(0)
+
+        covis = getattr(result, "covisibility", None)
+        if covis is not None:
+            covis_out = covis.mask if hasattr(covis, "mask") else covis
+            mask = torch.as_tensor(covis_out, dtype=torch.float32)
+            if mask.ndim == 3:  # BxHxW -> Bx1xHxW
+                mask = mask.unsqueeze(1)
+            elif mask.ndim == 2:
+                mask = mask.unsqueeze(0).unsqueeze(0)
+        else:
+            mask = None
+
+        # If result came back as a single item (B squeezed), expand appropriately
+        if flow.shape[0] != B:
+            # Fallback to loop if batch dim not preserved
+            raise RuntimeError("UFM batched output does not have expected batch dimension")
+
+        return flow, mask
