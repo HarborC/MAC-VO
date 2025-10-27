@@ -351,3 +351,26 @@ class CUDAGraph_FlowFormerCovFrontend(FlowFormerCovFrontend):
             result_cov = g_context.static_ouput["flow_cov"].clone()
             
         return result_val, result_cov
+
+
+class UFMCovFrontend(IFrontend):
+    """
+    Placeholder for UFMCov Frontend
+    """
+    def __init__(self, config: SimpleNamespace):
+        super().__init__(config)
+        raise NotImplementedError("UFMCovFrontend is not implemented yet.")
+    
+    @property
+    def provide_cov(self) -> tuple[bool, bool]:
+        return True, True
+    
+    def estimate_pair(self, frame_t1: StereoData, frame_t2: StereoData) -> tuple[IStereoDepth.Output, IMatcher.Output]:
+        raise NotImplementedError("UFMCovFrontend is not implemented yet.")
+    
+    def estimate_depth(self, frame: StereoData) -> IStereoDepth.Output:
+        raise NotImplementedError("UFMCovFrontend is not implemented yet.")
+    
+    @classmethod
+    def is_valid_config(cls, config: SimpleNamespace | None) -> None:
+        raise NotImplementedError("UFMCovFrontend is not implemented yet.")
