@@ -374,7 +374,7 @@ class UFMCovFrontend(IFrontend):
             ) from e
 
         # Choose model variant
-        variant: str = getattr(self.config, "model", "refine")
+        variant: str = getattr(self.config, "model", "base")
         pretrained_id: str | None = getattr(self.config, "pretrained_id", None)
 
         if variant == "refine":
@@ -406,7 +406,26 @@ class UFMCovFrontend(IFrontend):
     @property
     def provide_cov(self) -> tuple[bool, bool]:
         # UFM exposes covisibility mask/confidence but not covariance; return False for both
-        return False, False
+        return True, True
+    
+    @staticmethod
+    def inference_2_depth(flow_12: torch.Tensor, cov_12: torch.Tensor, frame: StereoData, enforce_positive_disparity: bool) -> IStereoDepth.Output:
+        disparity, disparity_cov = flow_12[:, :1].abs(), cov_12[:, :1]
+        depth_map = disparity_to_depth(disparity, frame.frame_baseline, frame.fx)
+        depth_cov = disparity_to_depth_cov(disparity, disparity_cov, frame.frame_baseline, frame.fx)
+        
+        if enforce_positive_disparity:
+            bad_mask = flow_12[:, :1] <= 0
+        else:
+            bad_mask = None
+        
+        return IStereoDepth.Output(depth=depth_map, cov=depth_cov, disparity=disparity, disparity_uncertainty=disparity_cov, mask=bad_mask)
+
+    @staticmethod
+    def inference_2_match(flow_12: torch.Tensor, cov_12: torch.Tensor) -> IMatcher.Output:
+        match_map, match_cov = flow_12, cov_12
+        match_mask = None
+        return IMatcher.Output.from_partial_cov(flow=match_map, cov=match_cov, mask=match_mask)
     
     @Timer.cpu_timeit("Frontend.estimate")
     @Timer.gpu_timeit("Frontend.estimate")
@@ -419,67 +438,27 @@ class UFMCovFrontend(IFrontend):
         input_B = input_B.to(device=self.config.device)
 
         # Run UFM on both pairs
-        flow_all, mask_all = self._run_ufm_batch(input_A, input_B)
+        est_flow, est_cov = self._run_ufm_batch(input_A, input_B)
 
-        B = frame_t2.imageL.shape[0]
-        flow_depth = flow_all[0:B]
-        mask_depth = None if mask_all is None else mask_all[0:B]
-        flow_match = flow_all[B:2*B]
-        mask_match = None if mask_all is None else mask_all[B:2*B]
-
-        # Depth output from disparity
-        disparity = flow_depth[:, :1].abs()
-        depth_map = disparity_to_depth(disparity, frame_t2.frame_baseline, frame_t2.fx)
-
-        bad_mask = None
-        if self.enforce_positive_disparity:
-            bad_mask = flow_depth[:, :1] <= 0
-        if mask_depth is not None:
-            vis_mask_bool = mask_depth >= self.mask_thresh
-            bad_mask = vis_mask_bool if bad_mask is None else (bad_mask | (~vis_mask_bool))
-
-        depth_t2 = IStereoDepth.Output(
-            depth=depth_map,
-            disparity=disparity,
-            cov=None,
-            mask=bad_mask,
-            disparity_uncertainty=None,
+        est_flow: torch.Tensor = est_flow.float()
+        est_cov : torch.Tensor = est_cov.float()
+        
+        return (
+            self.inference_2_depth(est_flow[0:1], est_cov[0:1], frame_t2, self.config.enforce_positive_disparity),
+            self.inference_2_match(est_flow[1:2], est_cov[1:2])
         )
-
-        match_mask = None
-        if mask_match is not None:
-            match_mask = (mask_match >= self.mask_thresh).to(dtype=torch.bool)
-        match_t12 = IMatcher.Output(flow=flow_match, cov=None, mask=match_mask)
-        return depth_t2, match_t12
     
     def estimate_depth(self, frame: StereoData) -> IStereoDepth.Output:
         input_A, input_B = frame.imageL, frame.imageR
         input_A = input_A.to(device=self.config.device)
         input_B = input_B.to(device=self.config.device)
         # Use UFM on rectified stereo pair (L->R), then interpret u as disparity
-        print(input_A.dtype)
-        flow, covis_mask = self._run_ufm_batch(input_A, input_B)
+        est_flow, est_cov = self._run_ufm_batch(input_A, input_B)
 
-        # Expect flow: Bx2xHxW, covis_mask: Bx1xHxW (float or bool)
-        disparity = flow[:, :1].abs()
-        depth_map = disparity_to_depth(disparity, frame.frame_baseline, frame.fx)
-
-        # Enforce disparity direction if requested
-        bad_mask = None
-        if self.enforce_positive_disparity:
-            bad_mask = flow[:, :1] <= 0
-        # Combine visibility mask if available
-        if covis_mask is not None:
-            vis_mask_bool = covis_mask >= self.mask_thresh
-            bad_mask = vis_mask_bool if bad_mask is None else (bad_mask | (~vis_mask_bool))
-
-        return IStereoDepth.Output(
-            depth=depth_map,
-            disparity=disparity,
-            cov=None,
-            mask=bad_mask,
-            disparity_uncertainty=None,
-        )
+        est_flow: torch.Tensor = est_flow.float()
+        est_cov : torch.Tensor = est_cov.float()
+        
+        return self.inference_2_depth(est_flow, est_cov, frame, self.config.enforce_positive_disparity)
     
     @classmethod
     def is_valid_config(cls, config: SimpleNamespace | None) -> None:
@@ -488,42 +467,20 @@ class UFMCovFrontend(IFrontend):
             "device": lambda s: isinstance(s, str) and ("cuda" in s or s == "cpu"),
             "covisibility_threshold": lambda v: isinstance(v, (float, int)) and 0.0 <= float(v) <= 1.0,
             "enforce_positive_disparity": lambda b: isinstance(b, bool),
-            # optional
-            # "pretrained_id": optional string if provided
         })
 
     @torch.inference_mode()
     def _run_ufm_batch(self, src_batch: torch.Tensor, tgt_batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # print("src_batch.shape:", src_batch.shape)
+        # print("tgt_batch.shape:", tgt_batch.shape)
+
         result = self.model.predict_correspondences_batched(
             source_image=src_batch,
             target_image=tgt_batch,
+            data_norm_type="dummy"
         )
 
-        flow_out = result.flow.flow_output
-        if isinstance(flow_out, torch.Tensor):
-            if flow_out.ndim == 3:
-                flow = flow_out.unsqueeze(0).to(dtype=torch.float32)
-            else:
-                flow = flow_out.to(dtype=torch.float32)  # Bx2xHxW expected
-        else:
-            flow = torch.as_tensor(flow_out, dtype=torch.float32)
-            if flow.ndim == 3:
-                flow = flow.unsqueeze(0)
-
-        covis = getattr(result, "covisibility", None)
-        if covis is not None:
-            covis_out = covis.mask if hasattr(covis, "mask") else covis
-            mask = torch.as_tensor(covis_out, dtype=torch.float32)
-            if mask.ndim == 3:  # BxHxW -> Bx1xHxW
-                mask = mask.unsqueeze(1)
-            elif mask.ndim == 2:
-                mask = mask.unsqueeze(0).unsqueeze(0)
-        else:
-            mask = None
-
-        # If result came back as a single item (B squeezed), expand appropriately
-        if flow.shape[0] != B:
-            # Fallback to loop if batch dim not preserved
-            raise RuntimeError("UFM batched output does not have expected batch dimension")
-
-        return flow, mask
+        
+        # print("result.flow.flow_output.shape:", result.flow.flow_output.shape)
+        # print("result.covisibility.mask.shape:", result.covisibility.mask.shape)
+        return result.flow.flow_output, result.covisibility.mask.unsqueeze(1).expand(-1, 2, -1, -1)  

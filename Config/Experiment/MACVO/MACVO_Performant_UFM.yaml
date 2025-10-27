@@ -64,9 +64,6 @@ Odometry:
     type: UFMCovFrontend
     args:
       device: *device
-      enc_dtype: fp32
-      dec_dtype: fp32
-      decoder_depth: 12
       enforce_positive_disparity: false
 
   motion:
