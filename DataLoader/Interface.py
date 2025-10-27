@@ -117,7 +117,6 @@ class MultiCameraData(Collatable):
     # Transformation from body frame to sensor frame
     T_BS: pp.LieTensor      # torch.float32, pp.SE3 of shape Bx7
     K   : torch.Tensor      # torch.float32 of shape Bx3x3
-    baseline: torch.Tensor   # Baseline (m) between left and right camera, len(list) = B
     time_ns : list[int]     # Time (ns) of data received, len(list) = B
     height: int             # H
     width : int             # W
@@ -128,10 +127,6 @@ class MultiCameraData(Collatable):
         return self.time_ns[0]
     @property
     def frame_ms(self) -> float: return self.frame_ns / 1000.
-    @property
-    def frame_baseline(self) -> float:
-        assert self.baseline.size(0) == 1, "Can only use frame_baseline on unbatched data"
-        return self.baseline.item()
     @property
     def frame_K(self) -> torch.Tensor:
         assert self.K.size(0) == 1, "Can only use frame_K on unbatched data"
@@ -153,7 +148,6 @@ class MultiCameraData(Collatable):
         "height": lambda batch: batch[0],
         "width" : lambda batch: batch[0],
     }
-
 
 
 @dataclass(kw_only=True)
@@ -237,6 +231,10 @@ class DataFramePair(DataFrame, T.Generic[T_Data]):
 @dataclass(kw_only=True)
 class StereoFrame(DataFrame):
     stereo   : StereoData
+
+@dataclass(kw_only=True)
+class MultiCameraFrame(DataFrame):
+    data   : MultiCameraData
 
 @dataclass(kw_only=True)
 class StereoInertialFrame(StereoFrame):

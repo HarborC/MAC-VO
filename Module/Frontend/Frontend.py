@@ -25,7 +25,7 @@ from typing import overload, Literal, Any
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from DataLoader import StereoData
+from DataLoader import StereoData, MultiCameraData
 from Utility.PrettyPrint import Logger
 from Utility.Timer import Timer
 from Utility.Extensions import ConfigTestableSubclass
@@ -287,6 +287,221 @@ class CUDAGraph_FlowFormerCovFrontend(FlowFormerCovFrontend):
         input_A = input_A.to(device=self.config.device)
         input_B = input_B.to(device=self.config.device)
 
+        est_flow, est_cov = self.cuda_graph_estimate(input_A, input_B)
+        time.sleep(0.0) # Hint OS scheduler for context switch
+        
+        est_flow = est_flow.float()
+        est_cov  = est_cov.float()
+        
+        return (
+            self.inference_2_depth(est_flow[0:1], est_cov[0:1], frame_t2, self.config.enforce_positive_disparity),
+            self.inference_2_match(est_flow[1:2], est_cov[1:2])
+        )
+    
+    def cuda_graph_estimate(self, inp_A: torch.Tensor, inp_B: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        If does not exist a cuda graph
+            build one and run inference through it. 
+            Store the resulted graph in frontend for future use.
+        If does exist a cuda graph
+            Launch graph with new input.
+        """
+        if self.cuda_graph is None:
+            Logger.write("info", "Building CUDAGraph for FlowFormerCovFrontend")
+            static_input_A, static_input_B   = torch.empty_like(inp_A, device='cuda'), torch.empty_like(inp_A, device='cuda')
+            
+            static_input_A.copy_(inp_A)
+            static_input_B.copy_(inp_B)
+            
+            output_val: None | torch.Tensor = None
+            output_cov: None | torch.Tensor = None
+            
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())  #type: ignore
+            with torch.cuda.stream(s):                  #type: ignore
+                for _ in range(3):
+                    output_val, output_cov = self.model.inference(static_input_A, static_input_B)
+            torch.cuda.current_stream().wait_stream(s)
+            assert output_val is not None and output_cov is not None
+            
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                static_output, static_output_cov = self.model.inference(static_input_A, static_input_B)
+            
+            self.cuda_graph = CUDAGraphHandler(
+                graph, inp_A.shape,
+                static_input={"input_A": static_input_A, "input_B": static_input_B},
+                static_ouput={"flow": static_output, "flow_cov": static_output_cov}
+            )
+            Logger.write("info", "CUDAGraph Built. Will use CUDAGraph for accelerated inference.")
+            
+            return output_val, output_cov
+        else:
+            g_context = self.cuda_graph
+            
+            assert inp_A.shape == g_context.shape, f"Input shape mismatch for CUDAGraph replay: {inp_A.shape} != {g_context.shape}"
+            
+            g_context.static_input["input_A"].copy_(inp_A)
+            g_context.static_input["input_B"].copy_(inp_B)
+            
+            g_context.graph.replay()
+            time.sleep(0.0) # Hint OS scheduler for context switch
+            
+            result_val = g_context.static_ouput["flow"].clone()
+            result_cov = g_context.static_ouput["flow_cov"].clone()
+            
+        return result_val, result_cov
+
+
+class FlowFormerCovFrontend2(IFrontend):
+    TENSOR_RT_AOT_RESULT_PATH = Path("./cache/FlowFormerCov_TRTCache")
+    T_SUPPORT_DTYPE = Literal["fp32", "bf16", "fp16"]
+    
+    def __init__(self, config: SimpleNamespace):
+        super().__init__(config)
+        
+        from ..Network.FlowFormer.configs.submission import get_cfg
+        from ..Network.FlowFormerCov import build_flowformer
+        
+        cfg = get_cfg()
+        cfg.latentcostformer.decoder_depth = self.config.decoder_depth
+        model = build_flowformer(cfg, reflect_torch_dtype(config.enc_dtype), reflect_torch_dtype(config.dec_dtype))
+        ckpt  = torch.load(self.config.weight, map_location=self.config.device, weights_only=True)
+        
+        model.eval()
+        model.to(self.config.device)
+        model.load_ddp_state_dict(ckpt)
+        self.model = model
+    
+    @property
+    def provide_cov(self) -> tuple[bool, bool]:
+        return True, True
+    
+    @staticmethod
+    def inference_2_depth(flow_12: torch.Tensor, cov_12: torch.Tensor, frame: StereoData, enforce_positive_disparity: bool) -> IStereoDepth.Output:
+        disparity, disparity_cov = flow_12[:, :1].abs(), cov_12[:, :1]
+        depth_map = disparity_to_depth(disparity, frame.frame_baseline, frame.fx)
+        depth_cov = disparity_to_depth_cov(disparity, disparity_cov, frame.frame_baseline, frame.fx)
+        
+        if enforce_positive_disparity:
+            bad_mask = flow_12[:, :1] <= 0
+        else:
+            bad_mask = None
+        
+        return IStereoDepth.Output(depth=depth_map, cov=depth_cov, disparity=disparity, disparity_uncertainty=disparity_cov, mask=bad_mask)
+
+    @staticmethod
+    def inference_2_match(flow_12: torch.Tensor, cov_12: torch.Tensor) -> IMatcher.Output:
+        match_map, match_cov = flow_12, cov_12
+        match_mask = None
+        return IMatcher.Output.from_partial_cov(flow=match_map, cov=match_cov, mask=match_mask)
+
+    @torch.inference_mode()
+    def estimate_depth(self, frame: MultiCameraData) -> IStereoDepth.Output:
+        stereo_num = len(frame.stereo_idxs)
+        cam_id0, cam_id1 = frame.stereo_idxs[0]
+        print('frame.images.shape', type(frame.images))
+        input_A = frame.images[cam_id0]
+        input_B = frame.images[cam_id1]
+        for stereo_id in range(1, stereo_num):
+            cam_id0, cam_id1 = frame.stereo_idxs[stereo_id]
+            input_A = torch.cat([input_A, frame.images[cam_id0]], dim=0)
+            input_B = torch.cat([input_B, frame.images[cam_id1]], dim=0)
+        
+        input_A = input_A.to(device=self.config.device)
+        input_B = input_B.to(device=self.config.device)
+        est_flow, est_cov = self.model.inference(input_A, input_B)
+        
+        est_flow: torch.Tensor = est_flow.float()
+        est_cov : torch.Tensor = est_cov.float()
+        
+        return self.inference_2_depth(est_flow, est_cov, frame, self.config.enforce_positive_disparity)
+    
+    @Timer.cpu_timeit("Frontend.estimate")
+    @Timer.gpu_timeit("Frontend.estimate")
+    @torch.inference_mode()
+    def estimate_pair(self, frame_t1: MultiCameraData, frame_t2: MultiCameraData) -> tuple[IStereoDepth.Output, IMatcher.Output]:
+        stereo_num = len(frame_t2.stereo_idxs)
+        cam_num = frame_t2.images.shape[0]
+
+        ii = []
+        jj = []
+        for cam_id in range(cam_num):
+            ii.append(cam_id)
+            jj.append(cam_id)
+
+        input_A = frame_t2.images[ii]
+        input_B = frame_t1.images[jj]
+
+        for stereo_id in range(stereo_num):
+            cam_id0, cam_id1 = frame_t2.stereo_idxs[stereo_id]
+            input_A = torch.cat([input_A, frame_t2.images[cam_id0]], dim=0)
+            input_B = torch.cat([input_B, frame_t1.images[cam_id1]], dim=0)
+        
+        input_A = input_A.to(device=self.config.device)
+        input_B = input_B.to(device=self.config.device)
+        est_flow, est_cov = self.model.inference(input_A, input_B)
+        
+        est_flow: torch.Tensor = est_flow.float()
+        est_cov : torch.Tensor = est_cov.float()
+        
+        return (
+            self.inference_2_depth(est_flow[0:1], est_cov[0:1], frame_t2, self.config.enforce_positive_disparity),
+            self.inference_2_match(est_flow[1:2], est_cov[1:2])
+        )
+    
+    @classmethod
+    def is_valid_config(cls, config: SimpleNamespace | None) -> None:
+        cls._enforce_config_spec(config, {
+            "weight"    : lambda s: isinstance(s, str), # Model Checkpoint path
+            "device"    : lambda s: isinstance(s, str) and (("cuda" in s) or (s == "cpu")),
+            "dec_dtype" : lambda b: isinstance(b, str) and b in ("fp32", "fp16", "bf16"),
+            "enc_dtype" : lambda b: isinstance(b, str) and b in ("fp32", "fp16", "bf16"),
+            "enforce_positive_disparity": lambda b: isinstance(b, bool),
+            "decoder_depth" : lambda v: isinstance(v, int)
+        })
+
+
+class CUDAGraph_FlowFormerCovFrontend2(FlowFormerCovFrontend2):
+    """
+    FlowformerCov Frontend, but using CUDAGraph acceleration to improve inference speed.
+    """
+    
+    def __init__(self, config: SimpleNamespace):
+        super().__init__(config)
+        
+        self.cuda_graph: CUDAGraphHandler | None = None
+        assert "cuda" in self.config.device.lower(), "CUDAGraph_FlowFormerCovFrontend can only run on CUDA device."
+        
+        torch.backends.cuda.matmul.allow_tf32 = True    # Allow tensor cores
+        torch.backends.cudnn.allow_tf32 = True          # Allow tensor cores
+        torch.set_float32_matmul_precision("medium")    # Reduced precision for higher throughput
+        torch.backends.cuda.preferred_linalg_library = "cusolver"   # For faster linalg ops
+       
+    @Timer.cpu_timeit("Frontend.estimate")
+    @Timer.gpu_timeit("Frontend.estimate")
+    def estimate_pair(self, frame_t1: MultiCameraData, frame_t2: MultiCameraData) -> tuple[IStereoDepth.Output, IMatcher.Output]:
+        # Joint inference
+        stereo_num = len(frame_t2.stereo_idxs)
+        cam_num = frame_t2.images.shape[0]
+
+        ii = []
+        jj = []
+        for cam_id in range(cam_num):
+            ii.append(cam_id)
+            jj.append(cam_id)
+
+        input_A = frame_t2.images[ii]
+        input_B = frame_t1.images[jj]
+
+        for stereo_id in range(stereo_num):
+            cam_id0 = frame_t2.stereo_idxs[stereo_id][0]
+            cam_id1 = frame_t2.stereo_idxs[stereo_id][1]
+            input_A = torch.cat([input_A, frame_t2.images[cam_id0]], dim=0)
+            input_B = torch.cat([input_B, frame_t1.images[cam_id1]], dim=0)
+        
+        input_A = input_A.to(device=self.config.device)
+        input_B = input_B.to(device=self.config.device)
         est_flow, est_cov = self.cuda_graph_estimate(input_A, input_B)
         time.sleep(0.0) # Hint OS scheduler for context switch
         

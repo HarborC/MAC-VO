@@ -21,10 +21,10 @@ from .Interface import IOdometry
 T_SensorFrame = T.TypeVar("T_SensorFrame", bound=StereoFrame)
 
 
-class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
+class MCVO(IOdometry[T_SensorFrame], ConfigTestable):
     # Type alias of callback hooks for MAC-VO system. Will be called by the system on
     # certain event occurs (optimization finish, for instance.)
-    T_SYSHOOK = Callable[["MACVO",], None]
+    T_SYSHOOK = Callable[["MCVO",], None]
     
     def __init__(
         self,
@@ -73,7 +73,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         self.prev_keyframe: tuple[T_SensorFrame, int, Module.IStereoDepth.Output] | None = None
         
         # Hooks
-        self.on_optimize_writeback: list[MACVO.T_SYSHOOK] = []
+        self.on_optimize_writeback: list[MCVO.T_SYSHOOK] = []
 
         self.report_config()
     
@@ -156,7 +156,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         })
 
     def initialize(self, frame0: T_SensorFrame):
-        depth0          = self.Frontend.estimate_depth(frame0.stereo)
+        depth0          = self.Frontend.estimate_depth(frame0.data)
         est_pose        = self.MotionEstimator.predict(frame0, None, depth0.depth).unsqueeze(0)
         
         frame_idx = self.graph.frames.push(FrameNode.init({
@@ -165,9 +165,8 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
             "need_interp" : torch.tensor([0], dtype=torch.bool),
             "time_ns"     : torch.tensor([frame0.stereo.frame_ns], dtype=torch.long),
             "K"           : frame0.stereo.K,
-            "baseline"    : frame0.stereo.baseline,
         }))
-        self.OutlierFilter.set_meta(frame0.stereo)
+        # self.OutlierFilter.set_meta(frame0.data)
         self.prev_keyframe = (frame0, int(frame_idx.item()), depth0)
 
     def run_pair(self, frame0: T_SensorFrame, frame1: T_SensorFrame) -> None:
@@ -179,7 +178,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
             return
         
         depth0          = self.prev_keyframe[2]
-        depth1, match01 = self.Frontend.estimate_pair(frame0.stereo, frame1.stereo)
+        depth1, match01 = self.Frontend.estimate_pair(frame0.data, frame1.data)
 
         # Receive optimization result from previous step (if exists) ####################
         # NOTE: should always writeback optimized pose to global map before selecting new 

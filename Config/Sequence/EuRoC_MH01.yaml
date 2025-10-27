@@ -1,4 +1,4 @@
-type: EuRoC
+type: EuRoC_NoIMU_MultiCamera
 name: MH01
 args:
     root: /home/gpcv/Data4/Datasets/euroc/V1_02_medium/mav0

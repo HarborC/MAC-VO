@@ -13,7 +13,7 @@ from Utility.PrettyPrint import Logger
 from Utility.Config import load_config
 from Utility.Math import qinterp, interpolate_pose
 
-from ..Interface import StereoData, IMUData, StereoFrame, StereoInertialFrame, AttitudeData
+from ..Interface import StereoData, IMUData, StereoFrame, StereoInertialFrame, AttitudeData, MultiCameraFrame, MultiCameraData
 from ..SequenceBase import SequenceBase
 
 
@@ -54,6 +54,132 @@ class EuRoC_Sequence(SequenceBase[StereoInertialFrame]):
             stereo=stereo_frame.stereo,
             imu=imu, gt_attitude=attitude
         )
+    
+    @classmethod
+    def is_valid_config(cls, config: SimpleNamespace | None) -> None:
+        cls._enforce_config_spec(config, {
+            "root"   : lambda v: isinstance(v, str),
+            "gt_pose": lambda b: isinstance(b, bool)
+        })
+
+class EuRoC_MultiCameraSequence(SequenceBase[MultiCameraFrame]):
+    @classmethod
+    def name(cls) -> str: return "EuRoC_NoIMU_MultiCamera"
+
+    def __init__(self, config: SimpleNamespace | dict[str, Any]) -> None:
+        cfg = self.config_dict2ns(config)
+        self.seqRoot  = Path(cfg.root)
+        
+        # ref: https://github.com/raulmur/ORB_SLAM2/blob/master/Examples/Stereo/EuRoC.yaml
+        # in this file only bl * fx is provided , the baseline here is derived by bf/fx
+        self.baseline = 0.1100778422
+        self.width = 752
+        self.height = 480
+        
+        # Left Camera
+        l_sensor_config, _ = load_config(Path(self.seqRoot, "cam0", "sensor.yaml"))
+        T_BS_lcam = np.array(l_sensor_config.T_BS.data).reshape(4, 4)
+        self.ImageL = EurocMonocularDataset(
+            Path(self.seqRoot, "cam0", "data"), 
+            K=self.build_intrinsic(l_sensor_config.intrinsics),
+            T_BS=T_BS_lcam,
+            undistort=np.array([-0.28340811, 0.07395907, 0.00019359, 1.76187114e-05, 0.0])
+        )
+        
+        # Right Camera
+        r_sensor_config, _ = load_config(Path(self.seqRoot, "cam1", "sensor.yaml"))
+        T_BS_rcam = np.array(r_sensor_config.T_BS.data).reshape(4, 4)
+        self.ImageR = EurocMonocularDataset(
+            Path(self.seqRoot, "cam1", "data"),
+            K=self.build_intrinsic(r_sensor_config.intrinsics),
+            T_BS=T_BS_rcam,
+            undistort=np.array([-0.28368365, 0.07451284, -0.00010473, -3.555907e-05, 0.0])
+        )
+        
+        # Sync left-right camera
+        rectified_K = self.sync_LR(self.ImageL, self.ImageR)
+        self.K = torch.tensor(rectified_K[:3, :3], dtype=torch.float).unsqueeze(0)
+        self.cam_timestamps = self.ImageL.cam_timestamps
+        assert len(self.ImageL) == len(self.ImageR), f"ImageL={len(self.ImageL)} and ImageR={len(self.ImageR)} is not sync'd as expected."
+        
+        # Setup metadata
+        self.T_BS_lcam = pp.from_matrix(
+            torch.tensor(T_BS_lcam, dtype=torch.float32).unsqueeze(0), pp.SE3_type
+        ) @ NED2EDN.unsqueeze(0)
+
+        self.T_BS_rcam = pp.from_matrix(
+            torch.tensor(T_BS_rcam, dtype=torch.float32).unsqueeze(0), pp.SE3_type
+        ) @ NED2EDN.unsqueeze(0)
+        
+        # Load ground truth pose
+        if cfg.gt_pose:
+            self.gt_pose_data, self.cam_time_mask = load_EurocGTPose(
+                Path(self.seqRoot, "state_groundtruth_estimate0/data.csv"),
+                self.ImageL.cam_timestamps
+            )
+            self.ImageL.apply_mask(self.cam_time_mask)
+            self.ImageR.apply_mask(self.cam_time_mask)
+        else:
+            self.gt_pose_data = None
+        
+        super().__init__(len(self.ImageL))
+
+    def __getitem__(self, local_index: int) -> MultiCameraFrame:
+        index = self.get_index(local_index)
+        images_data = torch.cat([self.ImageL[index], self.ImageR[index]], dim=0),
+
+        return MultiCameraFrame(
+            idx=[local_index],
+            time_ns=[int(self.cam_timestamps[index].item())], 
+            data=MultiCameraData(
+                T_BS=self.T_BS_lcam,
+                K   =self.K,
+                width=self.width,
+                height=self.height,
+                time_ns=[int(self.cam_timestamps[index].item())],
+                images=images_data,
+                stereo_idxs=[(0, 1)],
+            ),
+            gt_pose= None if self.gt_pose_data is None else cast(pp.LieTensor, self.gt_pose_data[index].unsqueeze(0))
+        )
+    
+    @staticmethod
+    def sync_LR(left: EurocMonocularDataset, right: EurocMonocularDataset) -> np.ndarray:
+        # Constant - Transformation from cam 1 to cam 2 (L -> R)
+        T_LR = np.linalg.inv(right.T_BS) @ left.T_BS
+        
+        # Align timestamps, discard time stamp with only Left/Right image.
+        left_time = {t_l.item() for t_l in left.cam_timestamps}
+        right_time = {t_r.item() for t_r in right.cam_timestamps}
+        common_time = left_time.intersection(right_time)
+        common_time = np.array(sorted(list(common_time)))
+        
+        left_sync_mask  = np.isin(left.cam_timestamps, common_time, assume_unique=True)
+        right_sync_mask = np.isin(right.cam_timestamps, common_time, assume_unique=True)
+        
+        left.cam_timestamps = left.cam_timestamps[left_sync_mask]
+        right.cam_timestamps = right.cam_timestamps[right_sync_mask]
+        left.file_names = [f for idx, f in enumerate(left.file_names) if left_sync_mask[idx].item()]
+        right.file_names = [f for idx, f in enumerate(right.file_names) if right_sync_mask[idx].item()]
+        left.length = len(left.file_names)
+        right.length = len(right.file_names)
+        
+        # Rectify stereo and undistort based on Left and Right camera.
+        R1, R2, P1, P2, Q, validRoi1, validRoi2 = cv2.stereoRectify(left.K, left.distort_factor, 
+                          right.K, right.distort_factor, (752, 480),
+                          T_LR[:3, :3], T_LR[:3, 3], flags=cv2.CALIB_ZERO_DISPARITY, alpha=-1)
+
+        left.undistort_map = cv2.initUndistortRectifyMap(left.K, left.distort_factor, R1, P1, (752, 480), cv2.CV_32FC1)
+        right.undistort_map = cv2.initUndistortRectifyMap(right.K, right.distort_factor, R2, P2, (752, 480), cv2.CV_32FC1)
+        left.K = P1[:3, :3]
+        right.K = P2[:3, :3]
+        
+        return P1
+
+    @staticmethod
+    def build_intrinsic(intrinsic: list[float]) -> np.ndarray:
+        fx, fy, cx, cy = intrinsic
+        return np.array([[fx, 0., cx], [0., fy, cy], [0., 0., 1.]])
     
     @classmethod
     def is_valid_config(cls, config: SimpleNamespace | None) -> None:
